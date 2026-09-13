@@ -1,0 +1,79 @@
+name: Windows offline EXE
+
+on:
+  push:
+    branches: [build/windows-offline-exe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Download the validated Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: j4rviscmd/bilibili-downloader-gui
+          run-id: 34764096615
+          name: windows-zip-editions
+          path: artifacts/input
+      - name: Prepare the offline installer resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Get-ChildItem artifacts/input/*-with-ffmpeg.zip
+          if ($archive.Count -ne 1) { throw 'Expected one validated FFmpeg ZIP' }
+          Expand-Archive $archive.FullName artifacts/offline
+          New-Item -ItemType Directory src-tauri/target/release -Force | Out-Null
+          Copy-Item artifacts/offline/bilibili-downloader-gui.exe src-tauri/target/release/
+          $resources = @{}
+          $resources[(Resolve-Path artifacts/offline/ffmpeg).Path] = 'ffmpeg/'
+          @{
+            bundle = @{
+              createUpdaterArtifacts = $false
+              resources = $resources
+              windows = @{
+                webviewInstallMode = @{ type = 'offlineInstaller' }
+              }
+            }
+          } | ConvertTo-Json -Depth 8 | Set-Content artifacts/offline-config.json
+      - name: Build the self-contained NSIS EXE
+        run: npm run tauri bundle -- --bundles nsis --config artifacts/offline-config.json
+      - name: Verify the installer and bundled FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe
+          if ($installer.Count -ne 1) { throw 'Expected one NSIS installer' }
+          $destination = "$env:RUNNER_TEMP/offline-installer-test"
+          $process = Start-Process $installer.FullName -ArgumentList @('/S', "/D=$destination") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+          if (!(Test-Path "$destination/bilibili-downloader-gui.exe")) { throw 'Installed application is missing' }
+          $ffmpeg = "$destination/ffmpeg/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe"
+          if (!(Test-Path $ffmpeg)) { throw 'Installed FFmpeg is missing' }
+          if (!(Test-Path "$destination/ffmpeg/win32-x64.LICENSE")) { throw 'FFmpeg license is missing' }
+          $original = 'artifacts/offline/ffmpeg/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe'
+          if ((Get-FileHash $ffmpeg).Hash -ne (Get-FileHash $original).Hash) { throw 'Installed FFmpeg checksum mismatch' }
+          & $ffmpeg -hide_banner -f lavfi -i anullsrc=r=44100:cl=stereo -t 0.05 -c:a aac -f null -
+          if ($LASTEXITCODE -ne 0) { throw 'Installed FFmpeg encode validation failed' }
+          New-Item -ItemType Directory artifacts/deliverable -Force | Out-Null
+          $name = 'bilibili-downloader-gui_1.59.0_Windows_x64-offline-setup.exe'
+          Copy-Item $installer.FullName "artifacts/deliverable/$name"
+          $hash = (Get-FileHash "artifacts/deliverable/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content "artifacts/deliverable/$name.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-offline-exe
+          path: artifacts/deliverable/*
+          if-no-files-found: error
+          compression-level: 0
